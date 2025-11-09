@@ -9,6 +9,7 @@ import matplotlib
 import numpy as np
 import pandas as pd
 from gymnasium import spaces
+from gymnasium.utils import seeding
 from stable_baselines3.common import logger
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.vec_env import SubprocVecEnv
@@ -104,7 +105,7 @@ class StockTradingEnvStopLoss(gym.Env):
         self.state_space = (
             1 + len(self.assets) + len(self.assets) * len(self.daily_information_cols)
         )
-        self.action_space = spaces.Box(low=-1, high=1, shape=(len(self.assets),))
+        self.action_space = spaces.Box(low=-1, high=1, shape=(len(self.assets),), )
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(self.state_space,)
         )
@@ -123,9 +124,8 @@ class StockTradingEnvStopLoss(gym.Env):
             print("data cached!")
 
     def seed(self, seed=None):
-        if seed is None:
-            seed = int(round(time.time() * 1000))
-        random.seed(seed)
+        self.np_random, seed = seeding.np_random(seed)
+        return [seed]
 
     @property
     def current_step(self):
@@ -167,7 +167,9 @@ class StockTradingEnvStopLoss(gym.Env):
             + self.get_date_vector(self.date_index)
         )
         self.state_memory.append(init_state)
-        return init_state
+        info = {}  # can store metadata like starting date or episode id
+        return init_state, info
+
 
     def get_date_vector(self, date, cols=None):
         if (cols is None) and (self.cached_data is not None):
@@ -218,7 +220,10 @@ class StockTradingEnvStopLoss(gym.Env):
             self.account_information["cash"][-1]
             / self.account_information["total_assets"][-1],
         )
-        return state, reward, True, {}
+        terminated = True
+        truncated = False
+        info = {"reason": reason}
+        return state, reward, terminated, truncated, info
 
     def log_step(self, reason, terminal_reward=None):
         if terminal_reward is None:
@@ -383,9 +388,10 @@ class StockTradingEnvStopLoss(gym.Env):
                     costs = 0
                 else:
                     # ... end the cycle and penalize
-                    return self.return_terminal(
+                    state, reward, terminated, truncated, info = self.return_terminal(
                         reason="CASH SHORTAGE", reward=self.get_reward()
                     )
+                    return state, reward, False, True, info   # truncated=True
 
             self.transaction_memory.append(actions)  # capture what the model's could do
 
@@ -444,7 +450,7 @@ class StockTradingEnvStopLoss(gym.Env):
             )
             self.state_memory.append(state)
 
-            return state, reward, False, {}
+            return state, reward, False, False, {}
 
     def get_sb_env(self):
         def get_self():

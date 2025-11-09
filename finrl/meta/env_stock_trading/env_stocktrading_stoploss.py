@@ -288,14 +288,20 @@ class StockTradingEnvStopLoss(gym.Env):
             low_profit_penalty = -1 * np.dot(
                 np.array(holdings), neg_profit_sell_diff_avg_buy
             )
+            cash_penalty /= self.initial_amount
+            stop_loss_penalty /= self.initial_amount
+            low_profit_penalty /= self.initial_amount
+
             total_penalty = cash_penalty + stop_loss_penalty + low_profit_penalty
 
             additional_reward = np.dot(np.array(holdings), pos_profit_sell_diff_avg_buy)
+            additional_reward /= self.initial_amount
 
             reward = (
                 (total_assets - total_penalty + additional_reward) / self.initial_amount
             ) - 1
-            reward /= self.current_step
+            # reward /= self.current_step
+            reward /= max(1, np.log1p(self.current_step))  # much gentler decay
 
             return reward
 
@@ -320,9 +326,7 @@ class StockTradingEnvStopLoss(gym.Env):
         else:
             # compute value of cash + assets
             begin_cash = self.state_memory[-1][0]
-            holdings = np.array(self.state_memory[-1][1 : len(self.assets) + 1], dtype=float)
             assert min(holdings) >= 0
-            closings = np.array(self.get_date_vector(self.date_index, cols=["close"]), dtype=float)
             asset_value = np.dot(holdings, closings)
             # reward is (cash + assets) - (cash_last_step + assets_last_step)
             reward = self.get_reward()

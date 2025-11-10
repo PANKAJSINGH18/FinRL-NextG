@@ -54,16 +54,6 @@ jobs:
           echo "pr_exists=$EXISTING_PR"
           echo "pr_exists=$EXISTING_PR" >> $GITHUB_OUTPUT
 
-      # - name: Create Pull Request if not exists
-      #   if: ${{ steps.diff.outputs.changes_count != '0' && steps.check-pr.outputs.pr_exists == '0' }}
-      #   uses: peter-evans/create-pull-request@v5
-      #   with:
-      #     token: ${{ secrets.GITHUB_TOKEN }}
-      #     branch: ${{ steps.branch.outputs.branch_name }}
-      #     base: main
-      #     title: ${{ steps.commit.outputs.commit_message }}
-      #     body: "This PR is automatically created."
-
       - name: Create Pull Request via API
         if: ${{ steps.diff.outputs.changes_count != '0' && steps.check-pr.outputs.pr_exists == '0' }}
         run: |

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 import time
+import sys
 from copy import deepcopy
 
 import gymnasium as gym
@@ -10,11 +11,21 @@ import numpy as np
 import pandas as pd
 from gymnasium import spaces
 from gymnasium.utils import seeding
-from stable_baselines3.common import logger
+import logging
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
 matplotlib.use("Agg")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ],
+    force=True
+)
+logger = logging.getLogger(__name__)
 
 
 class StockTradingEnvStopLoss(gym.Env):
@@ -191,31 +202,31 @@ class StockTradingEnvStopLoss(gym.Env):
         self.log_step(reason=reason, terminal_reward=reward)
         # Add outputs to logger interface
         gl_pct = self.account_information["total_assets"][-1] / self.initial_amount
-        logger.record("environment/GainLoss_pct", (gl_pct - 1) * 100)
-        logger.record(
+        logger.info("environment/GainLoss_pct", (gl_pct - 1) * 100)
+        logger.info(
             "environment/total_assets",
             int(self.account_information["total_assets"][-1]),
         )
         reward_pct = self.account_information["total_assets"][-1] / self.initial_amount
-        logger.record("environment/total_reward_pct", (reward_pct - 1) * 100)
-        logger.record("environment/total_trades", self.sum_trades)
-        logger.record(
+        logger.info("environment/total_reward_pct", (reward_pct - 1) * 100)
+        logger.info("environment/total_trades", self.sum_trades)
+        logger.info(
             "environment/actual_num_trades",
             self.actual_num_trades,
         )
-        logger.record(
+        logger.info(
             "environment/avg_daily_trades",
             self.sum_trades / (self.current_step),
         )
-        logger.record(
+        logger.info(
             "environment/avg_daily_trades_per_asset",
             self.sum_trades / (self.current_step) / len(self.assets),
         )
-        logger.record("environment/completed_steps", self.current_step)
-        logger.record(
+        logger.info("environment/completed_steps", self.current_step)
+        logger.info(
             "environment/sum_rewards", np.sum(self.account_information["reward"])
         )
-        logger.record(
+        logger.info(
             "environment/cash_proportion",
             self.account_information["cash"][-1]
             / self.account_information["total_assets"][-1],

@@ -1,0 +1,91 @@
+name: Auto PR Bot
+on:
+  push:
+    branches-ignore:
+      - main
+      - master
+
+jobs:
+  auto-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+
+      - name: Fetch main branch
+        run: git fetch origin main:main
+
+      - name: Get branch name
+        id: branch
+        run: |
+          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          echo "branch_name=$BRANCH_NAME"
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+
+
+      - name: Get latest commit message
+        id: commit
+        run: |
+          MESSAGE=$(git log -1 --pretty=%B | head -n 1)
+          if [ -z "$MESSAGE" ]; then
+            MESSAGE="Auto PR from ${GITHUB_REF#refs/heads/}"
+          fi
+          echo "commit_message=$MESSAGE"
+          echo "commit_message=$MESSAGE" >> $GITHUB_OUTPUT
+
+
+      - name: Check for changes against main
+        id: diff
+        run: |
+          BRANCH=${{ steps.branch.outputs.branch_name }}
+          COUNT=$(git rev-list --right-only --count main...$BRANCH)
+          echo "changes_count=$COUNT"
+          echo "changes_count=$COUNT" >> $GITHUB_OUTPUT
+
+      - name: Check if PR exists
+        id: check-pr
+        run: |
+          BRANCH=${{ steps.branch.outputs.branch_name }}
+          REPO=${GITHUB_REPOSITORY}
+          EXISTING_PR=$(curl -s -H "Authorization: token ${{ secrets.PERSONAL_TOKEN }}" \
+            "https://api.github.com/repos/${REPO}/pulls?head=${REPO%%/*}:$BRANCH&state=open" | jq '. | length')
+          echo "pr_exists=$EXISTING_PR"
+          echo "pr_exists=$EXISTING_PR" >> $GITHUB_OUTPUT
+
+      # - name: Create Pull Request if not exists
+      #   if: ${{ steps.diff.outputs.changes_count != '0' && steps.check-pr.outputs.pr_exists == '0' }}
+      #   uses: peter-evans/create-pull-request@v5
+      #   with:
+      #     token: ${{ secrets.GITHUB_TOKEN }}
+      #     branch: ${{ steps.branch.outputs.branch_name }}
+      #     base: main
+      #     title: ${{ steps.commit.outputs.commit_message }}
+      #     body: "This PR is automatically created."
+
+      - name: Create Pull Request via API
+        if: ${{ steps.diff.outputs.changes_count != '0' && steps.check-pr.outputs.pr_exists == '0' }}
+        run: |
+          BRANCH=${{ steps.branch.outputs.branch_name }}
+          TITLE="${{ steps.commit.outputs.commit_message }}"
+          BODY="This PR is automatically created by Auto PR Bot."
+
+          echo "Creating PR from $BRANCH to main"
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token ${{ secrets.PERSONAL_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls \
+            -d "{\"title\":\"$TITLE\",\"head\":\"$BRANCH\",\"base\":\"main\",\"body\":\"$BODY\"}")
+          echo "$RESPONSE" | jq '.'
+          echo "pr_number=$(echo "$RESPONSE" | jq -r '.number')" >> $GITHUB_OUTPUT
+
+      - name: Add label to PR
+        continue-on-error: true
+        if: ${{ steps.create_pr.outputs.pr_number != '' }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.PERSONAL_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${{ steps.create_pr.outputs.pr_number }}/labels \
+            -d '{"labels":["auto-pr"]}'

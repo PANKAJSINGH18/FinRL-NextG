@@ -312,7 +312,7 @@ class StockTradingEnvStopLoss(gym.Env):
                 (total_assets - total_penalty + additional_reward) / self.initial_amount
             ) - 1
             # reward /= self.current_step
-            reward /= max(1, np.log1p(self.current_step))  # much gentler decay
+            # reward /= max(1, np.log1p(self.current_step))  # much gentler decay
 
             return reward
 
@@ -329,7 +329,8 @@ class StockTradingEnvStopLoss(gym.Env):
             self.log_header()
         # print if it's time.
         if (self.current_step + 1) % self.print_verbosity == 0:
-            self.log_step(reason="update")
+            # self.log_step(reason="update")
+            pass
         # if we're at the end
         if self.date_index == len(self.dates) - 1:
             # if we hit the end, set reward to total gains (or losses)
@@ -359,7 +360,7 @@ class StockTradingEnvStopLoss(gym.Env):
                 # if turbulence goes over threshold, just clear out all positions
                 if self.turbulence >= self.turbulence_threshold:
                     actions = -(np.array(holdings) * closings)
-                    self.log_step(reason="TURBULENCE")
+                    # self.log_step(reason="TURBULENCE")
             # scale cash purchases to asset
             if self.discrete_actions:
                 # convert into integer because we can't buy fraction of shares
@@ -388,7 +389,8 @@ class StockTradingEnvStopLoss(gym.Env):
                 )
 
                 if any(np.clip(self.closing_diff_avg_buy, -np.inf, 0) < 0):
-                    self.log_step(reason="STOP LOSS")
+                    # self.log_step(reason="STOP LOSS")
+                    pass
 
             # compute our proceeds from sells, and add to cash
             sells = -np.clip(actions, -np.inf, 0)
@@ -403,7 +405,7 @@ class StockTradingEnvStopLoss(gym.Env):
             if (spend + costs) > coh:
                 if self.patient:
                     # ... just don't buy anything until we got additional cash
-                    self.log_step(reason="CASH SHORTAGE")
+                    # self.log_step(reason="CASH SHORTAGE")
                     actions = np.where(actions > 0, 0, actions)
                     spend = 0
                     costs = 0
@@ -431,10 +433,12 @@ class StockTradingEnvStopLoss(gym.Env):
             )
 
             if any(np.clip(self.profit_sell_diff_avg_buy, -np.inf, 0) < 0):
-                self.log_step(reason="LOW PROFIT")
+                # self.log_step(reason="LOW PROFIT")
+                pass
             else:
                 if any(np.clip(self.profit_sell_diff_avg_buy, 0, np.inf) > 0):
-                    self.log_step(reason="HIGH PROFIT")
+                    # self.log_step(reason="HIGH PROFIT")
+                    pass
 
             # verify we didn't do anything impossible here
             assert (spend + costs) <= coh

@@ -169,9 +169,16 @@ class StockTradingEnvStopLoss(gym.Env):
         self.n_buys = self._reusable_arrays['zeros_assets'].copy()
         self.avg_buy_price = self._reusable_arrays['zeros_assets'].copy()
         
-        # Set starting point
-        if self.random_start:
-            self.starting_point = random.choice(range(int(self.num_dates * 0.5)))
+        # # Set starting point
+        # if self.random_start:
+        #     self.starting_point = random.choice(range(int(self.num_dates * 0.5)))
+        # else:
+        #     self.starting_point = 0
+
+        # Set starting point with safety check
+        if self.random_start and self.num_dates > 1:
+            max_start = max(1, int(self.num_dates * 0.5))
+            self.starting_point = random.choice(range(max_start))
         else:
             self.starting_point = 0
             

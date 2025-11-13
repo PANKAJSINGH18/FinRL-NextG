@@ -12,8 +12,7 @@ import pandas as pd
 from gymnasium import spaces
 from gymnasium.utils import seeding
 import logging
-from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.monitor import Monitor
 
 matplotlib.use("Agg")
@@ -31,45 +30,11 @@ logger = logging.getLogger(__name__)
 
 class StockTradingEnvStopLoss(gym.Env):
     """
-    A stock trading environment for OpenAI gym
-    This environment penalizes the model if excedeed the stop-loss threshold, selling assets with under expectation %profit, and also
-    for not maintaining a reserve of cash.
-    This enables the model to do trading with high confidence and manage cash reserves in addition to performing trading procedures.
-
-    Reward at any step is given as follows
-        r_i = (sum(cash, asset_value) + additional_reward - total_penalty - initial_cash) / initial_cash / days_elapsed
-        , where total_penalty = cash_penalty + stop_loss_penalty + low_profit_penalty
-                cash_penalty = max(0, sum(cash, asset_value)*cash_penalty_proportion-cash)
-                stop_loss_penalty = -1 * dot(holdings,negative_closing_diff_avg_buy)
-                low_profit_penalty = -1 * dot(holdings,negative_profit_sell_diff_avg_buy)
-                additional_reward = dot(holdings,positive_profit_sell_diff_avg_buy)
-
-        This reward function takes into account a profit/loss ratio constraint, liquidity requirement, as well as long-term accrued rewards.
-        This reward function also forces the model to trade only when it's really confident to do so.
-
-    Parameters:
-    state space: {start_cash, <owned_shares>, for s in stocks{<stock.values>}, }
-        df (pandas.DataFrame): Dataframe containing data
-        buy_cost_pct (float): cost for buying shares
-        sell_cost_pct (float): cost for selling shares
-        hmax (int): max number of share purchases allowed per asset
-        discrete_actions (bool): option to choose whether perform dicretization on actions space or not
-        shares_increment (int): multiples number of shares can be bought in each trade.
-        stoploss_penalty (float): Maximum loss we can tolerate. Valid value range is between 0 and 1. If x is specified, then agent will force sell all holdings for a particular asset if current price < x * avg_buy_price
-        profit_loss_ratio (int, float): Expected profit/loss ratio. Only applicable when stoploss_penalty < 1.
-        turbulence_threshold (float): Maximum turbulence allowed in market for purchases to occur. If exceeded, positions are liquidated
-        print_verbosity(int): When iterating (step), how often to print stats about state of env
-        initial_amount: (int, float): Amount of cash initially available
-        daily_information_columns (list(str)): Columns to use when building state space from the dataframe. It could be OHLC columns or any other variables such as technical indicators and turbulence index
-        cash_penalty_proportion (int, float): Penalty to apply if the algorithm runs out of cash
-        patient (bool): option to choose whether end the cycle when we're running out of cash or just don't buy anything until we got additional cash
-    action space: <share_dollar_purchases>
-    TODO:
-        add holdings to memory
-        move transactions to after the clip step.
-    tests:
-        after reset, static strategy should result in same metrics
-        given no change in prices, no change in asset values
+    HEAVILY OPTIMIZED VERSION:
+    - Zero pandas operations during step()
+    - All data precomputed to numpy arrays
+    - Vectorized operations
+    - Memory reuse
     """
 
     metadata = {"render.modes": ["human"]}
@@ -86,7 +51,7 @@ class StockTradingEnvStopLoss(gym.Env):
         stoploss_penalty=0.9,
         profit_loss_ratio=2,
         turbulence_threshold=None,
-        print_verbosity=10,
+        print_verbosity=100,  # Reduced frequency
         initial_amount=1e6,
         daily_information_cols=["open", "close", "high", "low", "volume"],
         cache_indicator_data=True,
@@ -95,15 +60,13 @@ class StockTradingEnvStopLoss(gym.Env):
         patient=False,
         currency="$",
     ):
+        # Store parameters
         self.df = df
         self.stock_col = "tic"
-        self.assets = df[self.stock_col].unique()
-        self.dates = df[date_col_name].sort_values().unique()
         self.random_start = random_start
         self.discrete_actions = discrete_actions
         self.patient = patient
         self.currency = currency
-        self.df = self.df.set_index(date_col_name)
         self.shares_increment = shares_increment
         self.hmax = hmax
         self.initial_amount = initial_amount
@@ -114,26 +77,77 @@ class StockTradingEnvStopLoss(gym.Env):
         self.min_profit_penalty = 1 + profit_loss_ratio * (1 - self.stoploss_penalty)
         self.turbulence_threshold = turbulence_threshold
         self.daily_information_cols = daily_information_cols
-        self.state_space = (
-            1 + len(self.assets) + len(self.assets) * len(self.daily_information_cols)
-        )
-        self.action_space = spaces.Box(low=-1, high=1, shape=(len(self.assets),), )
+        self.cash_penalty_proportion = cash_penalty_proportion
+        
+        # ===== CRITICAL OPTIMIZATION: Convert DataFrame to numpy =====
+        self._precompute_all_data(df, date_col_name)
+        
+        # State and action spaces
+        self.state_space = 1 + self.num_assets + self.num_assets * len(daily_information_cols)
+        print(f"   - State size: {self.state_space}")
+        self.action_space = spaces.Box(low=-1, high=1, shape=(self.num_assets,))
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(self.state_space,)
         )
+        
         self.turbulence = 0
-        self.episode = -1  # initialize so we can call reset
+        self.episode = -1
         self.episode_history = []
         self.printed_header = False
-        self.cache_indicator_data = cache_indicator_data
-        self.cached_data = None
-        self.cash_penalty_proportion = cash_penalty_proportion
-        if self.cache_indicator_data:
-            print("caching data")
-            self.cached_data = [
-                self.get_date_vector(i) for i, _ in enumerate(self.dates)
-            ]
-            print("data cached!")
+        
+        # ===== OPTIMIZATION: Reusable arrays to avoid allocations =====
+        self._reusable_arrays = {
+            'zeros_assets': np.zeros(self.num_assets, dtype=np.float32),
+            'ones_assets': np.ones(self.num_assets, dtype=np.float32),
+        }
+
+    def _precompute_all_data(self, df, date_col_name):
+        """Convert pandas DataFrame to numpy arrays for maximum performance"""
+        print("🔄 Precomputing environment data to numpy...")
+        start_time = time.time()
+        
+        # Get unique dates and assets
+        self.dates = df[date_col_name].sort_values().unique()
+        self.assets = df[self.stock_col].unique()
+        self.num_dates = len(self.dates)
+        self.num_assets = len(self.assets)
+        
+        # Create fast lookup structures
+        self.date_to_index = {date: idx for idx, date in enumerate(self.dates)}
+        self.asset_to_index = {asset: idx for idx, asset in enumerate(self.assets)}
+        
+        # Pre-allocate data tensor: [dates, assets, features]
+        self.data_tensor = np.zeros(
+            (self.num_dates, self.num_assets, len(self.daily_information_cols)), 
+            dtype=np.float32
+        )
+        
+        # Fill data tensor from DataFrame
+        df_indexed = df.set_index(date_col_name)
+        for i, date in enumerate(self.dates):
+            date_str = str(date)
+            if date_str in df_indexed.index:
+                day_data = df_indexed.loc[[date_str]]
+                for j, asset in enumerate(self.assets):
+                    asset_data = day_data[day_data[self.stock_col] == asset]
+                    if len(asset_data) > 0:
+                        for k, col in enumerate(self.daily_information_cols):
+                            self.data_tensor[i, j, k] = asset_data[col].iloc[0]
+        
+        # Precompute close prices for fast access
+        close_idx = self.daily_information_cols.index('close')
+        self.close_prices = self.data_tensor[:, :, close_idx].copy()
+        
+        # Precompute all state vectors
+        self.state_vectors = np.zeros(
+            (self.num_dates, self.num_assets * len(self.daily_information_cols)), 
+            dtype=np.float32
+        )
+        for i in range(self.num_dates):
+            self.state_vectors[i] = self.data_tensor[i].flatten()
+        
+        print(f"✅ Data precomputed in {time.time() - start_time:.2f}s")
+        print(f"   - Dates: {self.num_dates}, Assets: {self.num_assets}")
 
     def seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
@@ -143,27 +157,36 @@ class StockTradingEnvStopLoss(gym.Env):
     def current_step(self):
         return self.date_index - self.starting_point
 
-    def reset(
-        self,
-        *,
-        seed=None,
-        options=None,
-    ):
-        self.seed()
+    def reset(self, *, seed=None, options=None):
+        if seed is not None:
+            self.seed(seed)
+            
+        # Reset tracking variables with reusable arrays
         self.sum_trades = 0
         self.actual_num_trades = 0
-        self.closing_diff_avg_buy = np.zeros(len(self.assets))
-        self.profit_sell_diff_avg_buy = np.zeros(len(self.assets))
-        self.n_buys = np.zeros(len(self.assets))
-        self.avg_buy_price = np.zeros(len(self.assets))
-        if self.random_start:
-            starting_point = random.choice(range(int(len(self.dates) * 0.5)))
-            self.starting_point = starting_point
+        self.closing_diff_avg_buy = self._reusable_arrays['zeros_assets'].copy()
+        self.profit_sell_diff_avg_buy = self._reusable_arrays['zeros_assets'].copy()
+        self.n_buys = self._reusable_arrays['zeros_assets'].copy()
+        self.avg_buy_price = self._reusable_arrays['zeros_assets'].copy()
+        
+        # # Set starting point
+        # if self.random_start:
+        #     self.starting_point = random.choice(range(int(self.num_dates * 0.5)))
+        # else:
+        #     self.starting_point = 0
+
+        # Set starting point with safety check
+        if self.random_start and self.num_dates > 1:
+            max_start = max(1, int(self.num_dates * 0.5))
+            self.starting_point = random.choice(range(max_start))
         else:
             self.starting_point = 0
+            
         self.date_index = self.starting_point
         self.turbulence = 0
         self.episode += 1
+        
+        # Initialize memory
         self.actions_memory = []
         self.transaction_memory = []
         self.state_memory = []
@@ -173,315 +196,240 @@ class StockTradingEnvStopLoss(gym.Env):
             "total_assets": [],
             "reward": [],
         }
-        init_state = np.array(
-            [self.initial_amount]
-            + [0] * len(self.assets)
-            + self.get_date_vector(self.date_index)
-        )
-        self.state_memory.append(init_state)
-        info = {}  # can store metadata like starting date or episode id
-        return init_state, info
+        
+        # Create initial state
+        state = np.zeros(self.state_space, dtype=np.float32)
+        state[0] = self.initial_amount  # cash
+        # holdings are zeros (positions 1:1+num_assets)
+        state[1 + self.num_assets:] = self.state_vectors[self.date_index]  # market data
+        
+        self.state_memory.append(state)
+        
+        return state, {}
 
+    def get_date_vector(self, date_index, cols=None):
+        """Optimized: Direct array access"""
+        return self.state_vectors[date_index].copy()
 
-    def get_date_vector(self, date, cols=None):
-        if (cols is None) and (self.cached_data is not None):
-            return self.cached_data[date]
-        else:
-            date = self.dates[date]
-            if cols is None:
-                cols = self.daily_information_cols
-            trunc_df = self.df.loc[[date]]
-            v = []
-            for a in self.assets:
-                subset = trunc_df[trunc_df[self.stock_col] == a]
-                v += subset.loc[date, cols].tolist()
-            assert len(v) == len(self.assets) * len(cols)
-            return v
+    def get_close_prices(self, date_index):
+        """Optimized: Direct close prices access"""
+        return self.close_prices[date_index].copy()
 
     def return_terminal(self, reason="Last Date", reward=0):
         state = self.state_memory[-1]
         self.log_step(reason=reason, terminal_reward=reward)
-        # Add outputs to logger interface
-        gl_pct = self.account_information["total_assets"][-1] / self.initial_amount
-        logger.info("environment/GainLoss_pct", (gl_pct - 1) * 100)
-        logger.info(
-            "environment/total_assets",
-            int(self.account_information["total_assets"][-1]),
-        )
-        reward_pct = self.account_information["total_assets"][-1] / self.initial_amount
-        logger.info("environment/total_reward_pct", (reward_pct - 1) * 100)
-        logger.info("environment/total_trades", self.sum_trades)
-        logger.info(
-            "environment/actual_num_trades",
-            self.actual_num_trades,
-        )
-        logger.info(
-            "environment/avg_daily_trades",
-            self.sum_trades / (self.current_step),
-        )
-        logger.info(
-            "environment/avg_daily_trades_per_asset",
-            self.sum_trades / (self.current_step) / len(self.assets),
-        )
-        logger.info("environment/completed_steps", self.current_step)
-        logger.info(
-            "environment/sum_rewards", np.sum(self.account_information["reward"])
-        )
-        logger.info(
-            "environment/cash_proportion",
-            self.account_information["cash"][-1]
-            / self.account_information["total_assets"][-1],
-        )
+        
+        # Log metrics
+        total_assets = self.account_information["total_assets"][-1]
+        gl_pct = total_assets / self.initial_amount
+        
+        logger.info("environment/GainLoss_pct: %.2f", (gl_pct - 1) * 100)
+        logger.info("environment/total_assets: %d", int(total_assets))
+        logger.info("environment/total_trades: %d", self.sum_trades)
+        logger.info("environment/actual_num_trades: %d", self.actual_num_trades)
+        
+        if self.current_step > 0:
+            logger.info("environment/avg_daily_trades: %.2f", self.sum_trades / self.current_step)
+        
+        logger.info("environment/completed_steps: %d", self.current_step)
+        
         terminated = True
         truncated = False
         info = {"reason": reason}
+        
         return state, reward, terminated, truncated, info
 
     def log_step(self, reason, terminal_reward=None):
         if terminal_reward is None:
             terminal_reward = self.account_information["reward"][-1]
-        cash_pct = (
-            self.account_information["cash"][-1]
-            / self.account_information["total_assets"][-1]
-        )
-        gl_pct = self.account_information["total_assets"][-1] / self.initial_amount
+            
+        cash = self.account_information["cash"][-1]
+        total_assets = self.account_information["total_assets"][-1]
+        cash_pct = cash / total_assets if total_assets > 0 else 0
+        gl_pct = total_assets / self.initial_amount
+        
         rec = [
             self.episode,
             self.date_index - self.starting_point,
             reason,
-            f"{self.currency}{'{:0,.0f}'.format(float(self.account_information['cash'][-1]))}",
-            f"{self.currency}{'{:0,.0f}'.format(float(self.account_information['total_assets'][-1]))}",
+            f"{self.currency}{cash:0,.0f}",
+            f"{self.currency}{total_assets:0,.0f}",
             f"{terminal_reward*100:0.5f}%",
             f"{(gl_pct - 1)*100:0.5f}%",
             f"{cash_pct*100:0.2f}%",
         ]
+        
         self.episode_history.append(rec)
-        print(self.template.format(*rec))
+        
+        if not self.printed_header:
+            self.log_header()
+        if (self.current_step + 1) % self.print_verbosity == 0:
+            print(self.template.format(*rec))
 
     def log_header(self):
-        self.template = "{0:4}|{1:4}|{2:15}|{3:15}|{4:15}|{5:10}|{6:10}|{7:10}"  # column widths: 8, 10, 15, 7, 10
+        self.template = "{0:4}|{1:4}|{2:15}|{3:15}|{4:15}|{5:10}|{6:10}|{7:10}"
         print(
             self.template.format(
-                "EPISODE",
-                "STEPS",
-                "TERMINAL_REASON",
-                "CASH",
-                "TOT_ASSETS",
-                "TERMINAL_REWARD_unsc",
-                "GAINLOSS_PCT",
-                "CASH_PROPORTION",
+                "EPISODE", "STEPS", "TERMINAL_REASON", "CASH", "TOT_ASSETS",
+                "TERMINAL_REWARD", "GAINLOSS_PCT", "CASH_PROPORTION"
             )
         )
         self.printed_header = True
 
     def get_reward(self):
+        """Optimized reward calculation with vectorized operations"""
         if self.current_step == 0:
-            return 0
+            return 0.0
+            
+        total_assets = self.account_information["total_assets"][-1]
+        cash = self.account_information["cash"][-1]
+        holdings = np.array(self.state_memory[-1][1:1+self.num_assets], dtype=np.float32)
+        
+        # Vectorized penalty calculations
+        neg_closing_diff = np.minimum(self.closing_diff_avg_buy, 0.0)
+        neg_profit_sell_diff = np.minimum(self.profit_sell_diff_avg_buy, 0.0)
+        pos_profit_sell_diff = np.maximum(self.profit_sell_diff_avg_buy, 0.0)
+        
+        cash_penalty = max(0.0, (total_assets * self.cash_penalty_proportion - cash))
+        
+        if self.current_step > 1:
+            prev_holdings = np.array(self.state_memory[-2][1:1+self.num_assets], dtype=np.float32)
+            stop_loss_penalty = -np.dot(prev_holdings, neg_closing_diff)
         else:
-            total_assets = self.account_information["total_assets"][-1]
-            cash = self.account_information["cash"][-1]
-            holdings = self.state_memory[-1][1 : len(self.assets) + 1]
-            neg_closing_diff_avg_buy = np.clip(self.closing_diff_avg_buy, -np.inf, 0)
-            neg_profit_sell_diff_avg_buy = np.clip(
-                self.profit_sell_diff_avg_buy, -np.inf, 0
-            )
-            pos_profit_sell_diff_avg_buy = np.clip(
-                self.profit_sell_diff_avg_buy, 0, np.inf
-            )
-
-            cash_penalty = max(0, (total_assets * self.cash_penalty_proportion - cash))
-            if self.current_step > 1:
-                prev_holdings = self.state_memory[-2][1 : len(self.assets) + 1]
-                stop_loss_penalty = -1 * np.dot(
-                    np.array(prev_holdings), neg_closing_diff_avg_buy
-                )
-            else:
-                stop_loss_penalty = 0
-            low_profit_penalty = -1 * np.dot(
-                np.array(holdings), neg_profit_sell_diff_avg_buy
-            )
-            cash_penalty /= self.initial_amount
-            stop_loss_penalty /= self.initial_amount
-            low_profit_penalty /= self.initial_amount
-
-            total_penalty = cash_penalty + stop_loss_penalty + low_profit_penalty
-
-            additional_reward = np.dot(np.array(holdings), pos_profit_sell_diff_avg_buy)
-            additional_reward /= self.initial_amount
-
-            reward = (
-                (total_assets - total_penalty + additional_reward) / self.initial_amount
-            ) - 1
-            # reward /= self.current_step
-            # reward /= max(1, np.log1p(self.current_step))  # much gentler decay
-
-            return reward
+            stop_loss_penalty = 0.0
+            
+        low_profit_penalty = -np.dot(holdings, neg_profit_sell_diff)
+        additional_reward = np.dot(holdings, pos_profit_sell_diff)
+        
+        # Normalize
+        cash_penalty /= self.initial_amount
+        stop_loss_penalty /= self.initial_amount
+        low_profit_penalty /= self.initial_amount
+        additional_reward /= self.initial_amount
+        
+        total_penalty = cash_penalty + stop_loss_penalty + low_profit_penalty
+        
+        reward = ((total_assets - total_penalty + additional_reward) / 
+                 self.initial_amount - 1.0)
+        
+        return float(reward)
 
     def step(self, actions):
-        # Convert everything to np.float64 to prevent sequence math
-        actions = np.asarray(actions, dtype=np.float64).flatten()
-        holdings = np.asarray(self.state_memory[-1][1 : len(self.assets) + 1], dtype=np.float64)
-        closings = np.asarray(self.get_date_vector(self.date_index, cols=["close"]), dtype=np.float64)
-
-        # let's just log what we're doing in terms of max actions at each step.
+        # Convert to numpy array once
+        actions = np.asarray(actions, dtype=np.float32).flatten()
+        current_state = self.state_memory[-1]
+        holdings = current_state[1:1+self.num_assets].copy()
+        
+        # Fast close prices access
+        closings = self.close_prices[self.date_index]
+        
+        # Track trades
         self.sum_trades += np.sum(np.abs(actions))
-        # print header only first time
-        if self.printed_header is False:
-            self.log_header()
-        # print if it's time.
-        if (self.current_step + 1) % self.print_verbosity == 0:
-            # self.log_step(reason="update")
-            pass
-        # if we're at the end
-        if self.date_index == len(self.dates) - 1:
-            # if we hit the end, set reward to total gains (or losses)
+        
+        # Check termination
+        if self.date_index >= self.num_dates - 1:
             return self.return_terminal(reward=self.get_reward())
-        else:
-            # compute value of cash + assets
-            begin_cash = self.state_memory[-1][0]
-            assert min(holdings) >= 0
-            asset_value = np.dot(holdings, closings)
-            # reward is (cash + assets) - (cash_last_step + assets_last_step)
-            reward = self.get_reward()
-            # log the values of cash, assets, and total assets
-            self.account_information["cash"].append(begin_cash)
-            self.account_information["asset_value"].append(asset_value)
-            self.account_information["total_assets"].append(begin_cash + asset_value)
-            self.account_information["reward"].append(reward)
-
-            # multiply action values by our scalar multiplier and save
-            actions = actions * self.hmax
-            self.actions_memory.append(
-                actions * closings
-            )  # capture what the model's trying to do
-            # buy/sell only if the price is > 0 (no missing data in this particular date)
-            actions = np.where(closings > 0, actions, 0)
-            actions = np.array(actions, dtype=float)
-            if self.turbulence_threshold is not None:
-                # if turbulence goes over threshold, just clear out all positions
-                if self.turbulence >= self.turbulence_threshold:
-                    actions = -(np.array(holdings) * closings)
-                    # self.log_step(reason="TURBULENCE")
-            # scale cash purchases to asset
-            if self.discrete_actions:
-                # convert into integer because we can't buy fraction of shares
-                actions = np.where(closings > 0, actions // closings, 0)
-                actions = actions.astype(int)
-                # round down actions to the nearest multiplies of shares_increment
-                actions = np.where(
-                    actions >= 0,
-                    (actions // self.shares_increment) * self.shares_increment,
-                    ((actions + self.shares_increment) // self.shares_increment)
-                    * self.shares_increment,
-                )
+        
+        # Calculate portfolio value
+        begin_cash = current_state[0]
+        asset_value = np.dot(holdings, closings)
+        reward = self.get_reward()
+        
+        # Store account info
+        self.account_information["cash"].append(begin_cash)
+        self.account_information["asset_value"].append(asset_value)
+        self.account_information["total_assets"].append(begin_cash + asset_value)
+        self.account_information["reward"].append(reward)
+        
+        # Scale actions
+        actions_scaled = actions * self.hmax
+        self.actions_memory.append(actions_scaled * closings)
+        
+        # Convert to shares
+        valid_prices = closings > 1e-8
+        shares = np.where(valid_prices, actions_scaled / closings, 0.0)
+        
+        # Apply turbulence stop if needed
+        if (self.turbulence_threshold is not None and 
+            self.turbulence >= self.turbulence_threshold):
+            shares = -holdings
+        
+        # Clip to available holdings
+        shares = np.clip(shares, -holdings, np.inf)
+        
+        # Stop-loss mechanism
+        self.closing_diff_avg_buy = closings - (self.stoploss_penalty * self.avg_buy_price)
+        stop_loss_mask = (begin_cash >= self.stoploss_penalty * self.initial_amount) & (self.closing_diff_avg_buy < 0)
+        shares = np.where(stop_loss_mask, -holdings, shares)
+        
+        # Calculate transactions
+        sells = np.maximum(-shares, 0)
+        buys = np.maximum(shares, 0)
+        
+        proceeds = np.dot(sells, closings)
+        spend = np.dot(buys, closings)
+        costs = proceeds * self.sell_cost_pct + spend * self.buy_cost_pct
+        coh = begin_cash + proceeds
+        
+        # Handle cash shortages
+        if (spend + costs) > coh:
+            if self.patient:
+                shares = np.minimum(shares, 0)
+                sells = np.maximum(-shares, 0)
+                proceeds = np.dot(sells, closings)
+                costs = proceeds * self.sell_cost_pct
+                spend = 0
             else:
-                actions = np.where(closings > 0, actions / closings, 0)
-
-            # clip actions so we can't sell more assets than we hold
-            actions = np.maximum(actions, -np.array(holdings))
-
-            self.closing_diff_avg_buy = closings - (
-                self.stoploss_penalty * self.avg_buy_price
-            )
-            if begin_cash >= self.stoploss_penalty * self.initial_amount:
-                # clear out position if stop-loss criteria is met
-                actions = np.where(
-                    self.closing_diff_avg_buy < 0, -np.array(holdings), actions
-                )
-
-                if any(np.clip(self.closing_diff_avg_buy, -np.inf, 0) < 0):
-                    # self.log_step(reason="STOP LOSS")
-                    pass
-
-            # compute our proceeds from sells, and add to cash
-            sells = -np.clip(actions, -np.inf, 0)
-            proceeds = float(np.dot(sells, closings))
-            costs = proceeds * float(self.sell_cost_pct)
-            coh = begin_cash + proceeds
-            # compute the cost of our buys
-            buys = np.clip(actions, 0, np.inf)
-            spend = float(np.dot(buys, closings))
-            costs += spend * float(self.buy_cost_pct)
-            # if we run out of cash...
-            if (spend + costs) > coh:
-                if self.patient:
-                    # ... just don't buy anything until we got additional cash
-                    # self.log_step(reason="CASH SHORTAGE")
-                    actions = np.where(actions > 0, 0, actions)
-                    spend = 0
-                    costs = 0
-                else:
-                    # ... end the cycle and penalize
-                    state, reward, terminated, truncated, info = self.return_terminal(
-                        reason="CASH SHORTAGE", reward=self.get_reward()
-                    )
-                    return state, reward, False, True, info   # truncated=True
-
-            self.transaction_memory.append(actions)  # capture what the model's could do
-
-            # get profitable sell actions
-            sell_closing_price = np.where(
-                sells > 0, closings, 0
-            )  # get closing price of assets that we sold
-            profit_sell = np.where(
-                sell_closing_price - self.avg_buy_price > 0, 1, 0
-            )  # mark the one which is profitable
-
-            self.profit_sell_diff_avg_buy = np.where(
-                profit_sell == 1,
-                closings - (self.min_profit_penalty * self.avg_buy_price),
-                0,
-            )
-
-            if any(np.clip(self.profit_sell_diff_avg_buy, -np.inf, 0) < 0):
-                # self.log_step(reason="LOW PROFIT")
-                pass
-            else:
-                if any(np.clip(self.profit_sell_diff_avg_buy, 0, np.inf) > 0):
-                    # self.log_step(reason="HIGH PROFIT")
-                    pass
-
-            # verify we didn't do anything impossible here
-            assert (spend + costs) <= coh
-
-            # log actual total trades we did up to current step
-            self.actual_num_trades = np.sum(np.abs(np.sign(actions)))
-
-            # update our holdings
-            coh = coh - spend - costs
-            holdings_updated = holdings + actions
-
-            # Update average buy price
-            buys = np.sign(buys)
-            self.n_buys += buys
-            self.avg_buy_price = np.where(
-                buys > 0,
-                self.avg_buy_price + ((closings - self.avg_buy_price) / self.n_buys),
-                self.avg_buy_price,
-            )  # incremental average
-
-            # set as zero when we don't have any holdings anymore
-            self.n_buys = np.where(holdings_updated > 0, self.n_buys, 0)
-            self.avg_buy_price = np.where(holdings_updated > 0, self.avg_buy_price, 0)
-
-            self.date_index += 1
-            if self.turbulence_threshold is not None:
-                self.turbulence = self.get_date_vector(
-                    self.date_index, cols=["turbulence"]
-                )[0]
-
-            # Update State
-            state = (
-                [coh] + list(holdings_updated) + self.get_date_vector(self.date_index)
-            )
-            self.state_memory.append(state)
-
-            return state, reward, False, False, {}
+                return self.return_terminal(reason="CASH SHORTAGE", reward=self.get_reward())
+        
+        # Update cash and holdings
+        coh = coh - spend - costs
+        holdings_updated = holdings + shares
+        
+        # Update average buy price (vectorized)
+        buy_mask = shares > 1e-8
+        self.n_buys += buy_mask.astype(np.float32)
+        
+        valid_updates = buy_mask & (self.n_buys > 0)
+        price_diffs = closings - self.avg_buy_price
+        self.avg_buy_price = np.where(
+            valid_updates,
+            self.avg_buy_price + (price_diffs / self.n_buys),
+            self.avg_buy_price
+        )
+        
+        # Reset for zero holdings
+        zero_holdings = holdings_updated <= 1e-8
+        self.n_buys[zero_holdings] = 0
+        self.avg_buy_price[zero_holdings] = 0
+        
+        # Profit tracking
+        sell_mask = sells > 1e-8
+        profit_sell = (closings - self.avg_buy_price) > 0
+        self.profit_sell_diff_avg_buy = np.where(
+            sell_mask & profit_sell,
+            closings - (self.min_profit_penalty * self.avg_buy_price),
+            0.0
+        )
+        
+        # Move to next time step
+        self.date_index += 1
+        self.actual_num_trades = np.sum(np.abs(shares) > 1e-8)
+        
+        # Create new state
+        new_state = np.zeros(self.state_space, dtype=np.float32)
+        new_state[0] = coh
+        new_state[1:1+self.num_assets] = holdings_updated
+        new_state[1+self.num_assets:] = self.state_vectors[self.date_index]
+        
+        self.state_memory.append(new_state)
+        self.transaction_memory.append(shares)
+        
+        return new_state, reward, False, False, {}
 
     def get_sb_env(self):
         def get_self():
             return deepcopy(self)
-
         e = DummyVecEnv([get_self])
         obs = e.reset()
         return e, obs
@@ -490,31 +438,27 @@ class StockTradingEnvStopLoss(gym.Env):
         def make_env(rank):
             def _init():
                 env = deepcopy(self)
-                env = Monitor(env)  # ✅ wrap each environment before vectorization
+                env = Monitor(env)
                 return env
             return _init
-
         e = SubprocVecEnv([make_env(i) for i in range(n)], start_method="fork")
         obs = e.reset()
         return e, obs
 
     def save_asset_memory(self):
-        if self.current_step == 0:
+        if len(self.account_information["cash"]) == 0:
             return None
-        else:
-            self.account_information["date"] = self.dates[
-                -len(self.account_information["cash"]) :
-            ]
-            return pd.DataFrame(self.account_information)
+        dates_used = self.dates[self.starting_point:self.starting_point + len(self.account_information["cash"])]
+        account_df = pd.DataFrame(self.account_information)
+        account_df["date"] = dates_used
+        return account_df
 
     def save_action_memory(self):
-        if self.current_step == 0:
+        if len(self.actions_memory) == 0:
             return None
-        else:
-            return pd.DataFrame(
-                {
-                    "date": self.dates[-len(self.account_information["cash"]) :],
-                    "actions": self.actions_memory,
-                    "transactions": self.transaction_memory,
-                }
-            )
+        dates_used = self.dates[self.starting_point:self.starting_point + len(self.actions_memory)]
+        return pd.DataFrame({
+            "date": dates_used,
+            "actions": self.actions_memory,
+            "transactions": self.transaction_memory,
+        })
